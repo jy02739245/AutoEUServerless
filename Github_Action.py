@@ -3,7 +3,7 @@
 """
 euserv 自动续期脚本
 功能:
-* 优先使用本地 ddddocr 自动识别验证码，必要时使用 TrueCaptcha API
+* 使用本地 ddddocr 自动识别验证码
 * 发送通知到 Telegram
 * 增加登录失败重试机制
 * 日志信息格式化
@@ -12,7 +12,6 @@ import os
 import re
 import json
 import time
-import base64
 import io
 import requests
 from bs4 import BeautifulSoup
@@ -20,10 +19,6 @@ from bs4 import BeautifulSoup
 # 账户信息：用户名和密码
 USERNAME = os.getenv('EUSERV_USERNAME')  # 填写用户名或邮箱
 PASSWORD = os.getenv('EUSERV_PASSWORD')  # 填写密码
-
-# TrueCaptcha API 配置
-TRUECAPTCHA_USERID = os.getenv('TRUECAPTCHA_USERID')
-TRUECAPTCHA_APIKEY = os.getenv('TRUECAPTCHA_APIKEY')
 
 # Mailparser 配置
 MAILPARSER_DOWNLOAD_URL_ID = os.getenv('MAILPARSER_DOWNLOAD_URL_ID')
@@ -43,16 +38,6 @@ LOGIN_MAX_RETRY_COUNT = 5
 # 接收 PIN 的等待时间，单位为秒
 WAITING_TIME_OF_PIN = 15
 
-# 是否检查验证码解决器的使用情况
-CHECK_CAPTCHA_SOLVER_USAGE = True
-
-# 是否优先使用 GitHub Action 本地 ddddocr 识别验证码
-ENABLE_DDDDOCR_OCR = os.getenv("ENABLE_DDDDOCR_OCR", "true").lower() not in (
-    "0",
-    "false",
-    "no",
-)
-
 # 登录验证码图片保存目录，GitHub Action 会上传该目录下的图片 artifact
 CAPTCHA_IMAGE_SAVE_DIR = os.getenv("CAPTCHA_IMAGE_SAVE_DIR", "captcha_images")
 
@@ -62,9 +47,6 @@ user_agent = (
 )
 desp = ""  # 日志信息
 _DDDDOCR_INSTANCE = None
-
-class CaptchaSolverError(RuntimeError):
-    pass
 
 def log(info: str):
     emoji_map = {
@@ -78,7 +60,6 @@ def log(info: str):
         "登陆失败": "❗",
         "验证通过": "✔️",
         "验证失败": "❌",
-        "API 使用次数": "📊",
         "验证码是": "🔢",
         "登录尝试": "🔑",
         "[MailParser]": "📧",
@@ -146,20 +127,25 @@ def save_captcha_image(image_content: bytes, source: str) -> str:
     if not image_content:
         return ""
 
-    os.makedirs(CAPTCHA_IMAGE_SAVE_DIR, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    millisecond = int(time.time() * 1000) % 1000
-    source_part = "_{}".format(source) if source else ""
-    filename = "login_captcha{}_{}_{:03d}.png".format(
-        source_part, timestamp, millisecond
-    )
-    path = os.path.join(CAPTCHA_IMAGE_SAVE_DIR, filename)
-    with open(path, "wb") as f:
-        f.write(image_content)
+    try:
+        os.makedirs(CAPTCHA_IMAGE_SAVE_DIR, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        millisecond = int(time.time() * 1000) % 1000
+        source_part = "_{}".format(source) if source else ""
+        filename = "login_captcha{}_{}_{:03d}.png".format(
+            source_part, timestamp, millisecond
+        )
+        path = os.path.join(CAPTCHA_IMAGE_SAVE_DIR, filename)
+        with open(path, "wb") as f:
+            f.write(image_content)
+    except OSError as exc:
+        log("[Captcha Solver] 保存登录验证码图片失败: {}".format(exc))
+        return ""
+
     log("[Captcha Solver] 已保存登录验证码图片: {}".format(path))
     return path
 
-# 获取登录验证码原图。只请求一次，避免本地 OCR 和 TrueCaptcha 看到不同验证码。
+# 获取登录验证码原图。只请求一次，确保本地 OCR 识别和日志对应同一张验证码。
 def fetch_captcha_image(captcha_image_url: str, session: requests.session) -> bytes:
     response = session.get(captcha_image_url)
     response.raise_for_status()
@@ -261,14 +247,11 @@ def choose_best_local_ocr_candidate(candidates: list) -> str:
 
 # 本地 ddddocr 验证码解决器
 def ddddocr_captcha_solver(captcha_image_content: bytes) -> str:
-    if not ENABLE_DDDDOCR_OCR:
-        return ""
-
     try:
         import ddddocr
         from PIL import Image
     except ImportError:
-        log("[Captcha Solver] 未安装 ddddocr 或 Pillow，跳过 ddddocr 本地 OCR。")
+        log("[Captcha Solver] 未安装 ddddocr 或 Pillow，本地 OCR 无法识别验证码。")
         return ""
 
     try:
@@ -286,15 +269,22 @@ def ddddocr_captcha_solver(captcha_image_content: bytes) -> str:
             return ""
 
     candidates = []
+    variant_error_count = 0
     variants = [image] + build_local_ocr_image_variants(image)
     for variant in variants:
         try:
             raw_text = _DDDDOCR_INSTANCE.classification(variant.convert("RGB"))
         except Exception:
+            variant_error_count += 1
             continue
         code = normalize_captcha_code(raw_text)
         if code:
             candidates.append(code)
+
+    if variant_error_count:
+        log("[Captcha Solver] ddddocr 本地 OCR 有 {} 个图片变体识别异常。".format(
+            variant_error_count
+        ))
 
     captcha_code = choose_best_local_ocr_candidate(candidates)
     if not captcha_code:
@@ -304,102 +294,18 @@ def ddddocr_captcha_solver(captcha_image_content: bytes) -> str:
     log("[Captcha Solver] ddddocr 本地 OCR 识别成功。")
     return captcha_code
 
-# TrueCaptcha 验证码解决器
-def truecaptcha_solver(captcha_image_content: bytes) -> dict:
-    # TrueCaptcha API 文档: https://apitruecaptcha.org/api
-    # 似乎已经无法免费试用,但是充值1刀可以识别3000个二维码,足够用一阵子了
-    if not TRUECAPTCHA_USERID or not TRUECAPTCHA_APIKEY:
-        raise CaptchaSolverError("本地 OCR 识别失败，且未配置 TrueCaptcha。")
-
-    encoded_string = base64.b64encode(captcha_image_content)
-    url = "https://api.apitruecaptcha.org/one/gettext"
-
-    data = {
-        "userid": TRUECAPTCHA_USERID,
-        "apikey": TRUECAPTCHA_APIKEY,
-        "case": "mixed",
-        "mode": "human",
-        "data": str(encoded_string)[2:-1],
-    }
-    r = requests.post(url=url, json=data)
-    j = json.loads(r.text)
-    return j
-
 # 验证码解决器
-def captcha_solver(captcha_image_url: str, session: requests.session) -> (str, str):
+def captcha_solver(captcha_image_url: str, session: requests.session) -> str:
     captcha_image_content = fetch_captcha_image(captcha_image_url, session)
     save_captcha_image(captcha_image_content, "")
 
     captcha_code = ddddocr_captcha_solver(captcha_image_content)
     if captcha_code:
-        return captcha_code, "ddddocr"
+        log("[Captcha Solver] 本地 OCR 识别结果: {}".format(captcha_code))
+        return captcha_code
 
-    if not TRUECAPTCHA_USERID or not TRUECAPTCHA_APIKEY:
-        log("[Captcha Solver] 本地 OCR 识别失败，且未配置 TrueCaptcha。")
-        return "", "none"
-
-    try:
-        solved_result = truecaptcha_solver(captcha_image_content)
-        return handle_captcha_solved_result(solved_result), "truecaptcha"
-    except CaptchaSolverError as exc:
-        log("[Captcha Solver] {}".format(exc))
-        return "", "truecaptcha"
-
-# 处理验证码解决结果
-def handle_captcha_solved_result(solved: dict) -> str:
-    # 处理验证码解决结果# 
-    if not solved.get("success", True):
-        message = solved.get("error_message") or solved.get("error") or solved
-        raise CaptchaSolverError("TrueCaptcha 识别失败: {}".format(message))
-    if "result" in solved:
-        solved_text = solved["result"]
-        if "RESULT  IS" in solved_text:
-            log("[Captcha Solver] 使用的是演示 apikey。")
-            # 因为使用了演示 apikey
-            text = re.findall(r"RESULT  IS . (.*) .", solved_text)[0]
-        else:
-            # 使用自己的 apikey
-            log("[Captcha Solver] 使用的是您自己的 apikey。")
-            text = solved_text
-        operators = ["X", "x", "+", "-"]
-        if any(x in text for x in operators):
-            for operator in operators:
-                operator_pos = text.find(operator)
-                if operator == "x" or operator == "X":
-                    operator = "*"
-                if operator_pos != -1:
-                    left_part = text[:operator_pos]
-                    right_part = text[operator_pos + 1 :]
-                    if left_part.isdigit() and right_part.isdigit():
-                        left = int(left_part)
-                        right = int(right_part)
-                        if operator == "+":
-                            return str(left + right)
-                        if operator == "-":
-                            return str(left - right)
-                        return str(left * right)
-                    else:
-                        # 这些符号("X", "x", "+", "-")不会同时出现，
-                        # 它只包含一个算术符号。
-                        return text
-        else:
-            return text
-    else:
-        print(solved)
-        raise CaptchaSolverError("TrueCaptcha 响应中未找到解析结果。")
-
-# 获取验证码解决器使用情况
-def get_captcha_solver_usage() -> dict:
-    # 获取验证码解决器的使用情况# 
-    url = "https://api.apitruecaptcha.org/one/getusage"
-
-    params = {
-        "username": TRUECAPTCHA_USERID,
-        "apikey": TRUECAPTCHA_APIKEY,
-    }
-    r = requests.get(url=url, params=params)
-    j = json.loads(r.text)
-    return j
+    log("[Captcha Solver] 本地 OCR 识别结果为空。")
+    return ""
 
 # 从 Mailparser 获取 PIN
 def get_pin_from_mailparser(url_id: str) -> str:
@@ -439,16 +345,11 @@ def login(username: str, password: str) -> (str, requests.session):
             return "-1", session
         else:
             log("[Captcha Solver] 正在进行验证码识别...")
-            captcha_code, solver_name = captcha_solver(captcha_image_url, session)
+            captcha_code = captcha_solver(captcha_image_url, session)
             if not captcha_code:
+                log("[Captcha Solver] 验证码识别无结果，跳过本次验证码提交。")
                 return "-1", session
             log("[Captcha Solver] 识别的验证码是: {}".format(captcha_code))
-
-            if CHECK_CAPTCHA_SOLVER_USAGE and solver_name == "truecaptcha":
-                usage = get_captcha_solver_usage()
-                log("[Captcha Solver] 当前日期 {0} API 使用次数: {1}".format(
-                    usage[0]["date"], usage[0]["count"]
-                ))
 
             f2 = session.post(
                 url,
@@ -647,10 +548,4 @@ def main_handler(event, context):
     print("*" * 30)
 
 if __name__ == "__main__":
-    try:
-        main_handler(None, None)
-    except CaptchaSolverError as exc:
-        log("[Captcha Solver] {}".format(exc))
-        if TG_BOT_TOKEN and TG_USER_ID and TG_API_HOST:
-            telegram()
-        raise SystemExit(1)
+    main_handler(None, None)

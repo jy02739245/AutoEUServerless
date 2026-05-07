@@ -3,28 +3,23 @@
 """
 euserv 自动续期脚本
 功能:
-* 使用 TrueCaptcha API 自动识别验证码
+* 使用本地 ddddocr 自动识别验证码
 * 发送通知到 Telegram
 * 增加登录失败重试机制
 * 日志信息格式化
 """
 
+import os
 import re
 import json
 import time
-import base64
+import io
 import requests
 from bs4 import BeautifulSoup
 
 # 账户信息：用户名和密码
 USERNAME = '改为你的EUserV客户ID 或 邮箱'  # 填写用户名或邮箱
 PASSWORD = '改为你的EUserV的密码'  # 填写密码
-
-# TrueCaptcha API 配置
-# 申请地址: https://truecaptcha.org/
-
-TRUECAPTCHA_USERID = '改为你的TrueCaptcha UserID'
-TRUECAPTCHA_APIKEY = '改为你的TrueCaptcha APIKEY'
 
 # Mailparser 配置
 MAILPARSER_DOWNLOAD_URL_ID = '改为你的Mailparser下载URL的最后几位' # 填写Mailparser的下载URL_ID
@@ -44,8 +39,8 @@ LOGIN_MAX_RETRY_COUNT = 5
 # 接收 PIN 的等待时间，单位为秒
 WAITING_TIME_OF_PIN = 15
 
-# 是否检查验证码解决器的使用情况
-CHECK_CAPTCHA_SOLVER_USAGE = True
+# 登录验证码图片保存目录
+CAPTCHA_IMAGE_SAVE_DIR = "captcha_images"
 
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -53,6 +48,7 @@ user_agent = (
 )
 
 desp = ""  # 日志信息
+_DDDDOCR_INSTANCE = None
 
 def log(info: str):
     # 打印并记录日志信息，附带 emoji 以增加可读性
@@ -67,7 +63,6 @@ def log(info: str):
         "登陆失败": "❗",
         "验证通过": "✔️",
         "验证失败": "❌",
-        "API 使用次数": "📊",
         "验证码是": "🔢",
         "登录尝试": "🔑",
         "[MailParser]": "📧",
@@ -111,76 +106,214 @@ def login_retry(*args, **kwargs):
         return inner
     return wrapper
 
-# 验证码解决器
-def captcha_solver(captcha_image_url: str, session: requests.session) -> dict:
-    # TrueCaptcha API 文档: https://apitruecaptcha.org/api
-    # 每天免费使用 100 次请求。
+# 规范化本地 OCR 返回的验证码文本
+def normalize_captcha_code(raw_text: str) -> str:
+    text = raw_text.strip()
+    text = text.replace(" ", "").replace("\n", "").replace("\t", "")
+    text = text.replace("=", "").replace("×", "x").replace("—", "-")
+    text = re.sub(r"[^0-9A-Za-z+\-*xX]", "", text)
+    if not text:
+        return ""
 
+    expression = re.fullmatch(r"(\d+)([+\-*xX])(\d+)", text)
+    if expression:
+        left = int(expression.group(1))
+        operator = expression.group(2)
+        right = int(expression.group(3))
+        if operator == "+":
+            return str(left + right)
+        if operator == "-":
+            return str(left - right)
+        return str(left * right)
+
+    if re.fullmatch(r"[0-9A-Za-z]{6}", text):
+        return text
+    return ""
+
+# 保存登录验证码原图，方便排查本地 OCR 识别问题
+def save_captcha_image(image_content: bytes, source: str) -> str:
+    if not image_content:
+        return ""
+
+    try:
+        os.makedirs(CAPTCHA_IMAGE_SAVE_DIR, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        millisecond = int(time.time() * 1000) % 1000
+        source_part = "_{}".format(source) if source else ""
+        filename = "login_captcha{}_{}_{:03d}.png".format(
+            source_part, timestamp, millisecond
+        )
+        path = os.path.join(CAPTCHA_IMAGE_SAVE_DIR, filename)
+        with open(path, "wb") as f:
+            f.write(image_content)
+    except OSError as exc:
+        log("[Captcha Solver] 保存登录验证码图片失败: {}".format(exc))
+        return ""
+
+    log("[Captcha Solver] 已保存登录验证码图片: {}".format(path))
+    return path
+
+# 获取登录验证码原图。只请求一次，确保本地 OCR 识别和日志对应同一张验证码。
+def fetch_captcha_image(captcha_image_url: str, session: requests.session) -> bytes:
     response = session.get(captcha_image_url)
-    encoded_string = base64.b64encode(response.content)
-    url = "https://api.apitruecaptcha.org/one/gettext"
+    response.raise_for_status()
+    return response.content
 
-    data = {
-        "userid": TRUECAPTCHA_USERID,
-        "apikey": TRUECAPTCHA_APIKEY,
-        "case": "mixed",
-        "mode": "human",
-        "data": str(encoded_string)[2:-1],
-    }
-    r = requests.post(url=url, json=data)
-    j = json.loads(r.text)
-    return j
+# 放大图片以提升本地 OCR 对小字符的识别率
+def upscale_for_ocr(image, factor=3, border=4):
+    from PIL import Image, ImageOps
 
-# 处理验证码解决结果
-def handle_captcha_solved_result(solved: dict) -> str:
-    # 处理验证码解决结果# 
-    if "result" in solved:
-        solved_text = solved["result"]
-        if "RESULT  IS" in solved_text:
-            log("[Captcha Solver] 使用的是演示 apikey。")
-            # 因为使用了演示 apikey
-            text = re.findall(r"RESULT  IS . (.*) .", solved_text)[0]
-        else:
-            # 使用自己的 apikey
-            log("[Captcha Solver] 使用的是您自己的 apikey。")
-            text = solved_text
-        operators = ["X", "x", "+", "-"]
-        if any(x in text for x in operators):
-            for operator in operators:
-                operator_pos = text.find(operator)
-                if operator == "x" or operator == "X":
-                    operator = "*"
-                if operator_pos != -1:
-                    left_part = text[:operator_pos]
-                    right_part = text[operator_pos + 1 :]
-                    if left_part.isdigit() and right_part.isdigit():
-                        return eval(
-                            "{left} {operator} {right}".format(
-                                left=left_part, operator=operator, right=right_part
-                            )
-                        )
-                    else:
-                        # 这些符号("X", "x", "+", "-")不会同时出现，
-                        # 它只包含一个算术符号。
-                        return text
-        else:
-            return text
-    else:
-        print(solved)
-        raise KeyError("未找到解析结果。")
+    resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    bordered = ImageOps.expand(image, border=border, fill=255)
+    width, height = bordered.size
+    return bordered.resize((width * factor, height * factor), resampling)
 
-# 获取验证码解决器使用情况
-def get_captcha_solver_usage() -> dict:
-    # 获取验证码解决器的使用情况# 
-    url = "https://api.apitruecaptcha.org/one/getusage"
+# 提取 EUserv 验证码常见的橙色前景
+def build_orange_foreground_mask(image):
+    from PIL import Image
 
-    params = {
-        "username": TRUECAPTCHA_USERID,
-        "apikey": TRUECAPTCHA_APIKEY,
-    }
-    r = requests.get(url=url, params=params)
-    j = json.loads(r.text)
-    return j
+    hsv = image.convert("HSV")
+    mask = Image.new("L", hsv.size, 255)
+    source = hsv.load()
+    target = mask.load()
+    for y in range(hsv.size[1]):
+        for x in range(hsv.size[0]):
+            hue, saturation, value = source[x, y]
+            if 2 <= hue <= 35 and saturation >= 45 and value >= 80:
+                target[x, y] = 0
+    return mask
+
+# 裁剪二值图前景，避免长干扰线和空白边缘影响本地 OCR
+def crop_foreground(image, pad=2):
+    pixels = image.load()
+    xs = []
+    ys = []
+    for y in range(image.size[1]):
+        for x in range(image.size[0]):
+            if pixels[x, y] < 128:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return image
+
+    left = max(0, min(xs) - pad)
+    top = max(0, min(ys) - pad)
+    right = min(image.size[0], max(xs) + pad + 1)
+    bottom = min(image.size[1], max(ys) + pad + 1)
+    return image.crop((left, top, right, bottom))
+
+# 生成适合本地 OCR 的验证码图片变体
+def build_local_ocr_image_variants(image):
+    from PIL import ImageFilter, ImageOps
+
+    grayscale = ImageOps.autocontrast(image.convert("L"))
+    scaled = upscale_for_ocr(grayscale)
+    denoised = scaled.filter(ImageFilter.MedianFilter(size=3))
+
+    variants = [scaled, denoised]
+    for threshold in (110, 140, 170, 200):
+        variants.append(scaled.point(lambda pixel, t=threshold: 255 if pixel > t else 0))
+        variants.append(denoised.point(lambda pixel, t=threshold: 255 if pixel > t else 0))
+
+    orange_base = build_orange_foreground_mask(image)
+    # 先在原图尺度去除细干扰线，再裁剪放大。这个策略对 EUserv 橙色验证码更稳定。
+    orange_opened = orange_base.filter(ImageFilter.MaxFilter(size=5)).filter(
+        ImageFilter.MinFilter(size=5)
+    )
+    for pad in (0, 2, 4, 8, 12):
+        cropped = crop_foreground(orange_opened, pad=pad)
+        for factor in (1, 2, 3, 4, 5, 6, 8):
+            variants.append(upscale_for_ocr(cropped, factor=factor, border=8))
+
+    orange_mask = upscale_for_ocr(orange_base)
+    orange_denoised = orange_mask.filter(ImageFilter.MedianFilter(size=3))
+    orange_opened = orange_denoised.filter(ImageFilter.MaxFilter(size=3)).filter(
+        ImageFilter.MinFilter(size=3)
+    )
+    orange_closed = orange_denoised.filter(ImageFilter.MinFilter(size=3)).filter(
+        ImageFilter.MaxFilter(size=3)
+    )
+    variants.extend([orange_mask, orange_denoised, orange_opened, orange_closed])
+    return variants
+
+# 根据多种 OCR 图片变体的结果挑选最稳定的验证码
+def choose_best_local_ocr_candidate(candidates: list) -> str:
+    if not candidates:
+        return ""
+
+    grouped_counts = {}
+    first_candidate = {}
+    for code in candidates:
+        group_key = code.lower() if re.fullmatch(r"[0-9A-Za-z]{6}", code) else code
+        grouped_counts[group_key] = grouped_counts.get(group_key, 0) + 1
+        first_candidate.setdefault(group_key, code)
+
+    best_group, count = max(grouped_counts.items(), key=lambda item: item[1])
+    if count < 2:
+        return ""
+    return first_candidate[best_group]
+
+# 本地 ddddocr 验证码解决器
+def ddddocr_captcha_solver(captcha_image_content: bytes) -> str:
+    try:
+        import ddddocr
+        from PIL import Image
+    except ImportError:
+        log("[Captcha Solver] 未安装 ddddocr 或 Pillow，本地 OCR 无法识别验证码。")
+        return ""
+
+    try:
+        image = Image.open(io.BytesIO(captcha_image_content))
+    except Exception as exc:
+        log("[Captcha Solver] ddddocr 无法读取验证码图片: {}".format(exc))
+        return ""
+
+    global _DDDDOCR_INSTANCE
+    if _DDDDOCR_INSTANCE is None:
+        try:
+            _DDDDOCR_INSTANCE = ddddocr.DdddOcr(show_ad=False)
+        except Exception as exc:
+            log("[Captcha Solver] ddddocr 初始化失败: {}".format(exc))
+            return ""
+
+    candidates = []
+    variant_error_count = 0
+    variants = [image] + build_local_ocr_image_variants(image)
+    for variant in variants:
+        try:
+            raw_text = _DDDDOCR_INSTANCE.classification(variant.convert("RGB"))
+        except Exception:
+            variant_error_count += 1
+            continue
+        code = normalize_captcha_code(raw_text)
+        if code:
+            candidates.append(code)
+
+    if variant_error_count:
+        log("[Captcha Solver] ddddocr 本地 OCR 有 {} 个图片变体识别异常。".format(
+            variant_error_count
+        ))
+
+    captcha_code = choose_best_local_ocr_candidate(candidates)
+    if not captcha_code:
+        log("[Captcha Solver] ddddocr 本地 OCR 未识别出稳定结果。")
+        return ""
+
+    log("[Captcha Solver] ddddocr 本地 OCR 识别成功。")
+    return captcha_code
+
+# 验证码解决器
+def captcha_solver(captcha_image_url: str, session: requests.session) -> str:
+    captcha_image_content = fetch_captcha_image(captcha_image_url, session)
+    save_captcha_image(captcha_image_content, "")
+
+    captcha_code = ddddocr_captcha_solver(captcha_image_content)
+    if captcha_code:
+        log("[Captcha Solver] 本地 OCR 识别结果: {}".format(captcha_code))
+        return captcha_code
+
+    log("[Captcha Solver] 本地 OCR 识别结果为空。")
+    return ""
 
 # 从 Mailparser 获取 PIN
 def get_pin_from_mailparser(url_id: str) -> str:
@@ -220,15 +353,11 @@ def login(username: str, password: str) -> (str, requests.session):
             return "-1", session
         else:
             log("[Captcha Solver] 正在进行验证码识别...")
-            solved_result = captcha_solver(captcha_image_url, session)
-            captcha_code = handle_captcha_solved_result(solved_result)
+            captcha_code = captcha_solver(captcha_image_url, session)
+            if not captcha_code:
+                log("[Captcha Solver] 验证码识别无结果，跳过本次验证码提交。")
+                return "-1", session
             log("[Captcha Solver] 识别的验证码是: {}".format(captcha_code))
-
-            if CHECK_CAPTCHA_SOLVER_USAGE:
-                usage = get_captcha_solver_usage()
-                log("[Captcha Solver] 当前日期 {0} API 使用次数: {1}".format(
-                    usage[0]["date"], usage[0]["count"]
-                ))
 
             f2 = session.post(
                 url,
