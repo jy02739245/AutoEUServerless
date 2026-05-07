@@ -3,7 +3,7 @@
 """
 euserv 自动续期脚本
 功能:
-* 使用 TrueCaptcha API 自动识别验证码
+* 优先使用本地 Tesseract OCR 自动识别验证码，必要时使用 TrueCaptcha API
 * 发送通知到 Telegram
 * 增加登录失败重试机制
 * 日志信息格式化
@@ -13,6 +13,8 @@ import re
 import json
 import time
 import base64
+import io
+import shutil
 import requests
 from bs4 import BeautifulSoup
 
@@ -45,11 +47,21 @@ WAITING_TIME_OF_PIN = 15
 # 是否检查验证码解决器的使用情况
 CHECK_CAPTCHA_SOLVER_USAGE = True
 
+# 是否优先使用 GitHub Action 本地 Tesseract OCR 识别验证码
+ENABLE_TESSERACT_OCR = os.getenv("ENABLE_TESSERACT_OCR", "true").lower() not in (
+    "0",
+    "false",
+    "no",
+)
+
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/95.0.4638.69 Safari/537.36"
 )
 desp = ""  # 日志信息
+
+class CaptchaSolverError(RuntimeError):
+    pass
 
 def log(info: str):
     emoji_map = {
@@ -107,10 +119,101 @@ def login_retry(*args, **kwargs):
         return inner
     return wrapper
 
-# 验证码解决器
-def captcha_solver(captcha_image_url: str, session: requests.session) -> dict:
+# 规范化本地 OCR 返回的验证码文本
+def normalize_captcha_code(raw_text: str) -> str:
+    text = raw_text.strip()
+    text = text.replace(" ", "").replace("\n", "").replace("\t", "")
+    text = text.replace("=", "").replace("×", "x").replace("—", "-")
+    text = re.sub(r"[^0-9A-Za-z+\-*xX]", "", text)
+    if not text:
+        return ""
+
+    expression = re.fullmatch(r"(\d+)([+\-*xX])(\d+)", text)
+    if expression:
+        left = int(expression.group(1))
+        operator = expression.group(2)
+        right = int(expression.group(3))
+        if operator == "+":
+            return str(left + right)
+        if operator == "-":
+            return str(left - right)
+        return str(left * right)
+
+    if re.fullmatch(r"[0-9A-Za-z]{3,8}", text):
+        return text
+    return ""
+
+# 生成适合 Tesseract 的验证码图片变体
+def build_tesseract_image_variants(image):
+    from PIL import Image, ImageFilter, ImageOps
+
+    resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    grayscale = ImageOps.autocontrast(image.convert("L"))
+    width, height = grayscale.size
+    scaled = grayscale.resize((width * 3, height * 3), resampling)
+    denoised = scaled.filter(ImageFilter.MedianFilter(size=3))
+
+    variants = [scaled, denoised]
+    for threshold in (110, 140, 170, 200):
+        variants.append(scaled.point(lambda pixel, t=threshold: 255 if pixel > t else 0))
+        variants.append(denoised.point(lambda pixel, t=threshold: 255 if pixel > t else 0))
+    return variants
+
+# 本地 Tesseract 验证码解决器
+def tesseract_captcha_solver(captcha_image_url: str, session: requests.session) -> str:
+    if not ENABLE_TESSERACT_OCR:
+        return ""
+    if not shutil.which("tesseract"):
+        log("[Captcha Solver] 未检测到本地 Tesseract，跳过本地 OCR。")
+        return ""
+
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        log("[Captcha Solver] 未安装 pytesseract 或 Pillow，跳过本地 OCR。")
+        return ""
+
+    response = session.get(captcha_image_url)
+    response.raise_for_status()
+
+    try:
+        image = Image.open(io.BytesIO(response.content))
+    except Exception as exc:
+        log("[Captcha Solver] 本地 OCR 无法读取验证码图片: {}".format(exc))
+        return ""
+
+    configs = [
+        "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-xX*",
+        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-xX*",
+        "--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-xX*",
+    ]
+    candidates = {}
+    for variant in build_tesseract_image_variants(image):
+        for config in configs:
+            raw_text = pytesseract.image_to_string(variant, config=config)
+            code = normalize_captcha_code(raw_text)
+            if code:
+                candidates[code] = candidates.get(code, 0) + 1
+
+    if not candidates:
+        log("[Captcha Solver] 本地 Tesseract OCR 未识别出可用结果。")
+        return ""
+
+    captcha_code, count = max(candidates.items(), key=lambda item: item[1])
+    if count < 2:
+        log("[Captcha Solver] 本地 Tesseract OCR 结果不稳定，改用备用识别方式。")
+        return ""
+
+    log("[Captcha Solver] 本地 Tesseract OCR 识别成功。")
+    return captcha_code
+
+# TrueCaptcha 验证码解决器
+def truecaptcha_solver(captcha_image_url: str, session: requests.session) -> dict:
     # TrueCaptcha API 文档: https://apitruecaptcha.org/api
     # 似乎已经无法免费试用,但是充值1刀可以识别3000个二维码,足够用一阵子了
+    if not TRUECAPTCHA_USERID or not TRUECAPTCHA_APIKEY:
+        raise CaptchaSolverError("本地 OCR 识别失败，且未配置 TrueCaptcha。")
 
     response = session.get(captcha_image_url)
     encoded_string = base64.b64encode(response.content)
@@ -127,9 +230,25 @@ def captcha_solver(captcha_image_url: str, session: requests.session) -> dict:
     j = json.loads(r.text)
     return j
 
+# 验证码解决器
+def captcha_solver(captcha_image_url: str, session: requests.session) -> (str, str):
+    captcha_code = tesseract_captcha_solver(captcha_image_url, session)
+    if captcha_code:
+        return captcha_code, "tesseract"
+
+    if not TRUECAPTCHA_USERID or not TRUECAPTCHA_APIKEY:
+        log("[Captcha Solver] 本地 OCR 识别失败，且未配置 TrueCaptcha。")
+        return "", "none"
+
+    solved_result = truecaptcha_solver(captcha_image_url, session)
+    return handle_captcha_solved_result(solved_result), "truecaptcha"
+
 # 处理验证码解决结果
 def handle_captcha_solved_result(solved: dict) -> str:
     # 处理验证码解决结果# 
+    if not solved.get("success", True):
+        message = solved.get("error_message") or solved.get("error") or solved
+        raise CaptchaSolverError("TrueCaptcha 识别失败: {}".format(message))
     if "result" in solved:
         solved_text = solved["result"]
         if "RESULT  IS" in solved_text:
@@ -150,11 +269,13 @@ def handle_captcha_solved_result(solved: dict) -> str:
                     left_part = text[:operator_pos]
                     right_part = text[operator_pos + 1 :]
                     if left_part.isdigit() and right_part.isdigit():
-                        return eval(
-                            "{left} {operator} {right}".format(
-                                left=left_part, operator=operator, right=right_part
-                            )
-                        )
+                        left = int(left_part)
+                        right = int(right_part)
+                        if operator == "+":
+                            return str(left + right)
+                        if operator == "-":
+                            return str(left - right)
+                        return str(left * right)
                     else:
                         # 这些符号("X", "x", "+", "-")不会同时出现，
                         # 它只包含一个算术符号。
@@ -163,7 +284,7 @@ def handle_captcha_solved_result(solved: dict) -> str:
             return text
     else:
         print(solved)
-        raise KeyError("未找到解析结果。")
+        raise CaptchaSolverError("TrueCaptcha 响应中未找到解析结果。")
 
 # 获取验证码解决器使用情况
 def get_captcha_solver_usage() -> dict:
@@ -216,11 +337,12 @@ def login(username: str, password: str) -> (str, requests.session):
             return "-1", session
         else:
             log("[Captcha Solver] 正在进行验证码识别...")
-            solved_result = captcha_solver(captcha_image_url, session)
-            captcha_code = handle_captcha_solved_result(solved_result)
+            captcha_code, solver_name = captcha_solver(captcha_image_url, session)
+            if not captcha_code:
+                return "-1", session
             log("[Captcha Solver] 识别的验证码是: {}".format(captcha_code))
 
-            if CHECK_CAPTCHA_SOLVER_USAGE:
+            if CHECK_CAPTCHA_SOLVER_USAGE and solver_name == "truecaptcha":
                 usage = get_captcha_solver_usage()
                 log("[Captcha Solver] 当前日期 {0} API 使用次数: {1}".format(
                     usage[0]["date"], usage[0]["count"]
@@ -423,4 +545,10 @@ def main_handler(event, context):
     print("*" * 30)
 
 if __name__ == "__main__":
-     main_handler(None, None)
+    try:
+        main_handler(None, None)
+    except CaptchaSolverError as exc:
+        log("[Captcha Solver] {}".format(exc))
+        if TG_BOT_TOKEN and TG_USER_ID and TG_API_HOST:
+            telegram()
+        raise SystemExit(1)
