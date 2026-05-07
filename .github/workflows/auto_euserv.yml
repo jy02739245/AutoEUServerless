@@ -16,13 +16,11 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@main
       with:
-        python-version: '3.x'  # 指定Python3.x
+        python-version: '3.12'  # ddddocr/onnxruntime 在 3.12 下更稳定
 
     - name: Install dependencies
       run: |
-        sudo apt-get update
-        sudo apt-get install -y tesseract-ocr
-        pip install requests beautifulsoup4 pillow pytesseract
+        pip install requests beautifulsoup4 pillow ddddocr==1.6.1
 
     - name: Run script
       env:
@@ -30,6 +28,7 @@ jobs:
         EUSERV_PASSWORD: ${{ secrets.EUSERV_PASSWORD }}
         TRUECAPTCHA_USERID: ${{ secrets.TRUECAPTCHA_USERID }}
         TRUECAPTCHA_APIKEY: ${{ secrets.TRUECAPTCHA_APIKEY }}
+        ENABLE_DDDDOCR_OCR: "true"
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_USER_ID: ${{ secrets.TG_USER_ID }}
         MAILPARSER_DOWNLOAD_URL_ID: ${{ secrets.MAILPARSER_DOWNLOAD_URL_ID }}

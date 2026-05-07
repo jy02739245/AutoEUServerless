@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import argparse
 import re
-import shutil
 from collections import Counter
 from pathlib import Path
 
-import pytesseract
 from PIL import Image, ImageFilter, ImageOps
+
+try:
+    import ddddocr
+except ImportError:
+    ddddocr = None
 
 
 def normalize_captcha_code(raw_text: str) -> str:
@@ -28,7 +31,7 @@ def normalize_captcha_code(raw_text: str) -> str:
             return str(left - right)
         return str(left * right)
 
-    if re.fullmatch(r"[0-9A-Za-z]{3,8}", text):
+    if re.fullmatch(r"[0-9A-Za-z]{6}", text):
         return text
     return ""
 
@@ -128,6 +131,57 @@ def build_variants(image):
     return variants
 
 
+def choose_best_local_ocr_candidate(candidates):
+    if not candidates:
+        return ""
+
+    grouped_counts = Counter()
+    first_candidate = {}
+    for code in candidates:
+        group_key = code.lower() if re.fullmatch(r"[0-9A-Za-z]{6}", code) else code
+        grouped_counts[group_key] += 1
+        first_candidate.setdefault(group_key, code)
+
+    best_group, count = grouped_counts.most_common(1)[0]
+    if count < 2:
+        return ""
+    return first_candidate[best_group]
+
+
+def run_ddddocr(variants):
+    if ddddocr is None:
+        print("DdddOCR: not installed. Install with: pip install ddddocr")
+        return
+
+    print("DdddOCR:")
+    ocr = ddddocr.DdddOcr(show_ad=False)
+    candidates = []
+    raw_counter = Counter()
+    for name, variant in variants:
+        try:
+            raw_text = ocr.classification(variant.convert("RGB"))
+        except Exception as exc:
+            print(f"{name:<32} raw=ERR {type(exc).__name__}: {exc}")
+            continue
+
+        code = normalize_captcha_code(raw_text)
+        print(f"{name:<32} raw={raw_text!r:<12} code={code!r}")
+        if code:
+            candidates.append(code)
+            raw_counter[code] += 1
+
+    print()
+    if raw_counter:
+        print("DdddOCR raw candidate ranking:")
+        for code, count in raw_counter.most_common():
+            print(f"{code}: {count}")
+        best = choose_best_local_ocr_candidate(candidates)
+        print(f"DdddOCR selected: {best or '<unstable>'}")
+    else:
+        print("DdddOCR found no usable OCR candidate.")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Debug EUserv captcha OCR locally.")
     parser.add_argument("image", help="Path to a saved captcha image")
@@ -138,44 +192,23 @@ def main():
     )
     args = parser.parse_args()
 
-    if not shutil.which("tesseract"):
-        raise SystemExit("tesseract was not found. Install it with: brew install tesseract")
-
     image_path = Path(args.image)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     image = Image.open(image_path)
-    configs = [
-        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-xX* -c load_system_dawg=0 -c load_freq_dawg=0",
-        "--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-xX* -c load_system_dawg=0 -c load_freq_dawg=0",
-    ]
+    variants = build_variants(image)
 
-    candidates = Counter()
     print(f"Image: {image_path}")
     print(f"Variant images: {out_dir}")
     print()
 
-    for index, (name, variant) in enumerate(build_variants(image), start=1):
+    run_ddddocr(variants)
+
+    for index, (name, variant) in enumerate(variants, start=1):
         variant_path = out_dir / f"{index:02d}_{name}.png"
         variant.save(variant_path)
-        for config in configs:
-            raw_text = pytesseract.image_to_string(variant, config=config)
-            code = normalize_captcha_code(raw_text)
-            psm = re.search(r"--psm\s+(\d+)", config).group(1)
-            print(
-                f"{variant_path.name:<32} psm={psm:<2} raw={raw_text.strip()!r:<12} code={code!r}"
-            )
-            if code:
-                candidates[code] += 1
-
-    print()
-    if candidates:
-        print("Candidate ranking:")
-        for code, count in candidates.most_common():
-            print(f"{code}: {count}")
-    else:
-        print("No usable OCR candidate found.")
+    print(f"Saved {len(variants)} variant images.")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 """
 euserv 自动续期脚本
 功能:
-* 优先使用本地 Tesseract OCR 自动识别验证码，必要时使用 TrueCaptcha API
+* 优先使用本地 ddddocr 自动识别验证码，必要时使用 TrueCaptcha API
 * 发送通知到 Telegram
 * 增加登录失败重试机制
 * 日志信息格式化
@@ -14,7 +14,6 @@ import json
 import time
 import base64
 import io
-import shutil
 import requests
 from bs4 import BeautifulSoup
 
@@ -47,8 +46,8 @@ WAITING_TIME_OF_PIN = 15
 # 是否检查验证码解决器的使用情况
 CHECK_CAPTCHA_SOLVER_USAGE = True
 
-# 是否优先使用 GitHub Action 本地 Tesseract OCR 识别验证码
-ENABLE_TESSERACT_OCR = os.getenv("ENABLE_TESSERACT_OCR", "true").lower() not in (
+# 是否优先使用 GitHub Action 本地 ddddocr 识别验证码
+ENABLE_DDDDOCR_OCR = os.getenv("ENABLE_DDDDOCR_OCR", "true").lower() not in (
     "0",
     "false",
     "no",
@@ -62,6 +61,7 @@ user_agent = (
     "Chrome/95.0.4638.69 Safari/537.36"
 )
 desp = ""  # 日志信息
+_DDDDOCR_INSTANCE = None
 
 class CaptchaSolverError(RuntimeError):
     pass
@@ -165,7 +165,7 @@ def fetch_captcha_image(captcha_image_url: str, session: requests.session) -> by
     response.raise_for_status()
     return response.content
 
-# 放大图片以提升 Tesseract 对小字符的识别率
+# 放大图片以提升本地 OCR 对小字符的识别率
 def upscale_for_ocr(image, factor=3, border=4):
     from PIL import Image, ImageOps
 
@@ -189,7 +189,7 @@ def build_orange_foreground_mask(image):
                 target[x, y] = 0
     return mask
 
-# 裁剪二值图前景，避免长干扰线和空白边缘影响 Tesseract
+# 裁剪二值图前景，避免长干扰线和空白边缘影响本地 OCR
 def crop_foreground(image, pad=2):
     pixels = image.load()
     xs = []
@@ -208,8 +208,8 @@ def crop_foreground(image, pad=2):
     bottom = min(image.size[1], max(ys) + pad + 1)
     return image.crop((left, top, right, bottom))
 
-# 生成适合 Tesseract 的验证码图片变体
-def build_tesseract_image_variants(image):
+# 生成适合本地 OCR 的验证码图片变体
+def build_local_ocr_image_variants(image):
     from PIL import ImageFilter, ImageOps
 
     grayscale = ImageOps.autocontrast(image.convert("L"))
@@ -242,49 +242,66 @@ def build_tesseract_image_variants(image):
     variants.extend([orange_mask, orange_denoised, orange_opened, orange_closed])
     return variants
 
-# 本地 Tesseract 验证码解决器
-def tesseract_captcha_solver(captcha_image_content: bytes) -> str:
-    if not ENABLE_TESSERACT_OCR:
+# 根据多种 OCR 图片变体的结果挑选最稳定的验证码
+def choose_best_local_ocr_candidate(candidates: list) -> str:
+    if not candidates:
         return ""
-    if not shutil.which("tesseract"):
-        log("[Captcha Solver] 未检测到本地 Tesseract，跳过本地 OCR。")
+
+    grouped_counts = {}
+    first_candidate = {}
+    for code in candidates:
+        group_key = code.lower() if re.fullmatch(r"[0-9A-Za-z]{6}", code) else code
+        grouped_counts[group_key] = grouped_counts.get(group_key, 0) + 1
+        first_candidate.setdefault(group_key, code)
+
+    best_group, count = max(grouped_counts.items(), key=lambda item: item[1])
+    if count < 2:
+        return ""
+    return first_candidate[best_group]
+
+# 本地 ddddocr 验证码解决器
+def ddddocr_captcha_solver(captcha_image_content: bytes) -> str:
+    if not ENABLE_DDDDOCR_OCR:
         return ""
 
     try:
-        import pytesseract
+        import ddddocr
         from PIL import Image
     except ImportError:
-        log("[Captcha Solver] 未安装 pytesseract 或 Pillow，跳过本地 OCR。")
+        log("[Captcha Solver] 未安装 ddddocr 或 Pillow，跳过 ddddocr 本地 OCR。")
         return ""
 
     try:
         image = Image.open(io.BytesIO(captcha_image_content))
     except Exception as exc:
-        log("[Captcha Solver] 本地 OCR 无法读取验证码图片: {}".format(exc))
+        log("[Captcha Solver] ddddocr 无法读取验证码图片: {}".format(exc))
         return ""
 
-    configs = [
-        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-xX* -c load_system_dawg=0 -c load_freq_dawg=0",
-        "--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-xX* -c load_system_dawg=0 -c load_freq_dawg=0",
-    ]
-    candidates = {}
-    for variant in build_tesseract_image_variants(image):
-        for config in configs:
-            raw_text = pytesseract.image_to_string(variant, config=config)
-            code = normalize_captcha_code(raw_text)
-            if code:
-                candidates[code] = candidates.get(code, 0) + 1
+    global _DDDDOCR_INSTANCE
+    if _DDDDOCR_INSTANCE is None:
+        try:
+            _DDDDOCR_INSTANCE = ddddocr.DdddOcr(show_ad=False)
+        except Exception as exc:
+            log("[Captcha Solver] ddddocr 初始化失败: {}".format(exc))
+            return ""
 
-    if not candidates:
-        log("[Captcha Solver] 本地 Tesseract OCR 未识别出可用结果。")
+    candidates = []
+    variants = [image] + build_local_ocr_image_variants(image)
+    for variant in variants:
+        try:
+            raw_text = _DDDDOCR_INSTANCE.classification(variant.convert("RGB"))
+        except Exception:
+            continue
+        code = normalize_captcha_code(raw_text)
+        if code:
+            candidates.append(code)
+
+    captcha_code = choose_best_local_ocr_candidate(candidates)
+    if not captcha_code:
+        log("[Captcha Solver] ddddocr 本地 OCR 未识别出稳定结果。")
         return ""
 
-    captcha_code, count = max(candidates.items(), key=lambda item: item[1])
-    if count < 2:
-        log("[Captcha Solver] 本地 Tesseract OCR 结果不稳定，改用备用识别方式。")
-        return ""
-
-    log("[Captcha Solver] 本地 Tesseract OCR 识别成功。")
+    log("[Captcha Solver] ddddocr 本地 OCR 识别成功。")
     return captcha_code
 
 # TrueCaptcha 验证码解决器
@@ -313,9 +330,9 @@ def captcha_solver(captcha_image_url: str, session: requests.session) -> (str, s
     captcha_image_content = fetch_captcha_image(captcha_image_url, session)
     save_captcha_image(captcha_image_content, "")
 
-    captcha_code = tesseract_captcha_solver(captcha_image_content)
+    captcha_code = ddddocr_captcha_solver(captcha_image_content)
     if captcha_code:
-        return captcha_code, "tesseract"
+        return captcha_code, "ddddocr"
 
     if not TRUECAPTCHA_USERID or not TRUECAPTCHA_APIKEY:
         log("[Captcha Solver] 本地 OCR 识别失败，且未配置 TrueCaptcha。")
