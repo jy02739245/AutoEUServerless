@@ -34,3 +34,12 @@ jobs:
         TG_USER_ID: ${{ secrets.TG_USER_ID }}
         MAILPARSER_DOWNLOAD_URL_ID: ${{ secrets.MAILPARSER_DOWNLOAD_URL_ID }}
       run: python Github_Action.py
+
+    - name: Upload captcha images
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: login-captcha-images
+        path: captcha_images/*.png
+        if-no-files-found: ignore
+        retention-days: 7

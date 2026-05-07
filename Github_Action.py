@@ -54,6 +54,9 @@ ENABLE_TESSERACT_OCR = os.getenv("ENABLE_TESSERACT_OCR", "true").lower() not in 
     "no",
 )
 
+# 登录验证码图片保存目录，GitHub Action 会上传该目录下的图片 artifact
+CAPTCHA_IMAGE_SAVE_DIR = os.getenv("CAPTCHA_IMAGE_SAVE_DIR", "captcha_images")
+
 user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/95.0.4638.69 Safari/537.36"
@@ -143,6 +146,21 @@ def normalize_captcha_code(raw_text: str) -> str:
         return text
     return ""
 
+# 保存登录验证码原图，方便在 GitHub Action artifact 中查看
+def save_captcha_image(image_content: bytes, source: str) -> str:
+    if not image_content:
+        return ""
+
+    os.makedirs(CAPTCHA_IMAGE_SAVE_DIR, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    millisecond = int(time.time() * 1000) % 1000
+    filename = "login_captcha_{}_{}_{:03d}.png".format(source, timestamp, millisecond)
+    path = os.path.join(CAPTCHA_IMAGE_SAVE_DIR, filename)
+    with open(path, "wb") as f:
+        f.write(image_content)
+    log("[Captcha Solver] 已保存登录验证码图片: {}".format(path))
+    return path
+
 # 生成适合 Tesseract 的验证码图片变体
 def build_tesseract_image_variants(image):
     from PIL import Image, ImageFilter, ImageOps
@@ -176,6 +194,7 @@ def tesseract_captcha_solver(captcha_image_url: str, session: requests.session) 
 
     response = session.get(captcha_image_url)
     response.raise_for_status()
+    save_captcha_image(response.content, "tesseract")
 
     try:
         image = Image.open(io.BytesIO(response.content))
@@ -216,6 +235,8 @@ def truecaptcha_solver(captcha_image_url: str, session: requests.session) -> dic
         raise CaptchaSolverError("本地 OCR 识别失败，且未配置 TrueCaptcha。")
 
     response = session.get(captcha_image_url)
+    response.raise_for_status()
+    save_captcha_image(response.content, "truecaptcha")
     encoded_string = base64.b64encode(response.content)
     url = "https://api.apitruecaptcha.org/one/gettext"
 
