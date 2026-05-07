@@ -679,7 +679,7 @@ def main_handler(event, context):
                 else:
                     log("[AutoEUServerless] ServerID: %s 已成功续订!" % k, notify=True)
             else:
-                log("[AutoEUServerless] ServerID: %s 无需更新" % k)
+                log("[AutoEUServerless] ServerID: %s 无需更新" % k, notify=True)
         time.sleep(15)
         check(sessid, s)
         time.sleep(5)
