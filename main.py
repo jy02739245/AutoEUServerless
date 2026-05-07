@@ -65,6 +65,8 @@ def log(info: str):
         "验证失败": "❌",
         "验证码是": "🔢",
         "登录尝试": "🔑",
+        "[Login]": "🔐",
+        "[Renew]": "🛠️",
         "[MailParser]": "📧",
         "[Captcha Solver]": "🧩",
         "[AutoEUServerless]": "🌐",
@@ -315,14 +317,58 @@ def captcha_solver(captcha_image_url: str, session: requests.session) -> str:
     log("[Captcha Solver] 本地 OCR 识别结果为空。")
     return ""
 
+def summarize_payload(payload, limit=500) -> str:
+    try:
+        text = json.dumps(payload, ensure_ascii=False)
+    except TypeError:
+        text = str(payload)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[:limit] + "...(已截断)"
+    return text
+
 # 从 Mailparser 获取 PIN
 def get_pin_from_mailparser(url_id: str) -> str:
-    # 从 Mailparser 获取 PIN# 
-    response = requests.get(
-        f"{MAILPARSER_DOWNLOAD_BASE_URL}{url_id}",
-    )
-    pin = response.json()[0]["pin"]
-    return pin
+    # 从 Mailparser 获取 PIN#
+    log("[MailParser] 开始获取 PIN。")
+    try:
+        response = requests.get(f"{MAILPARSER_DOWNLOAD_BASE_URL}{url_id}")
+        log("[MailParser] 下载 URL 请求完成，HTTP 状态码: {}".format(
+            response.status_code
+        ))
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        log("[MailParser] 获取 PIN 失败：下载 URL 请求异常: {}".format(exc))
+        return ""
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        log("[MailParser] 获取 PIN 失败：返回内容不是合法 JSON: {}".format(exc))
+        log("[MailParser] 返回内容片段: {}".format(response.text[:500]))
+        return ""
+
+    if not isinstance(payload, list) or not payload:
+        log("[MailParser] 获取 PIN 失败：返回 JSON 不是非空列表。")
+        log("[MailParser] 返回内容摘要: {}".format(summarize_payload(payload)))
+        return ""
+
+    first_item = payload[0]
+    if not isinstance(first_item, dict):
+        log("[MailParser] 获取 PIN 失败：返回列表第一项不是对象。")
+        log("[MailParser] 返回内容摘要: {}".format(summarize_payload(payload)))
+        return ""
+
+    pin = first_item.get("pin")
+    if not pin:
+        log("[MailParser] 获取 PIN 失败：返回对象中没有 pin 字段。")
+        log("[MailParser] 这说明 EUserv 登录已成功，当前失败发生在续期后的 Mailparser/PIN 解析阶段。")
+        log("[MailParser] 返回字段: {}".format(", ".join(sorted(first_item.keys()))))
+        log("[MailParser] 返回内容摘要: {}".format(summarize_payload(first_item)))
+        return ""
+
+    log("[MailParser] 成功获取 PIN。")
+    return str(pin)
 
 # 登录函数
 @login_retry(max_retry=LOGIN_MAX_RETRY_COUNT)
@@ -333,8 +379,15 @@ def login(username: str, password: str) -> (str, requests.session):
     captcha_image_url = "https://support.euserv.com/securimage_show.php"
     session = requests.Session()
 
+    log("[Login] 开始登录 EUserv。")
     sess = session.get(url, headers=headers)
-    sess_id = re.findall("PHPSESSID=(\\w{10,100});", str(sess.headers))[0]
+    log("[Login] 登录页请求完成，HTTP 状态码: {}".format(sess.status_code))
+    sess.raise_for_status()
+    sess_id_match = re.findall("PHPSESSID=(\\w{10,100});", str(sess.headers))
+    if not sess_id_match:
+        log("[Login] 登录失败：没有从响应头中找到 PHPSESSID。")
+        return "-1", session
+    sess_id = sess_id_match[0]
     session.get("https://support.euserv.com/pic/logo_small.png", headers=headers)
 
     login_data = {
@@ -345,13 +398,17 @@ def login(username: str, password: str) -> (str, requests.session):
         "subaction": "login",
         "sess_id": sess_id,
     }
+    log("[Login] 已提交账号密码，等待 EUserv 登录结果。")
     f = session.post(url, headers=headers, data=login_data)
+    log("[Login] 账号密码登录请求完成，HTTP 状态码: {}".format(f.status_code))
     f.raise_for_status()
 
     if "Hello" not in f.text and "Confirm or change your customer data here" not in f.text:
         if "To finish the login process please solve the following captcha." not in f.text:
+            log("[Login] 登录失败：页面未显示登录成功，也未要求验证码，可能是账号密码错误或页面结构变化。")
             return "-1", session
         else:
+            log("[Login] 账号密码已通过，EUserv 要求继续完成验证码。")
             log("[Captcha Solver] 正在进行验证码识别...")
             captcha_code = captcha_solver(captcha_image_url, session)
             if not captcha_code:
@@ -370,11 +427,14 @@ def login(username: str, password: str) -> (str, requests.session):
             )
             if "To finish the login process please solve the following captcha." not in f2.text:
                 log("[Captcha Solver] 验证通过")
+                log("[Login] 登录成功，已获得有效 session。")
                 return sess_id, session
             else:
                 log("[Captcha Solver] 验证失败")
+                log("[Login] 登录失败：验证码提交后仍被要求继续验证。")
                 return "-1", session
     else:
+        log("[Login] 登录成功，已获得有效 session。")
         return sess_id, session
 
 # 获取服务器列表
@@ -415,6 +475,7 @@ def renew(
         "origin": "https://support.euserv.com",
         "Referer": "https://support.euserv.com/index.iphp",
     }
+    log("[Renew] ServerID: {} 开始续期流程。".format(order_id))
     data = {
         "Submit": "Extend contract",
         "sess_id": sess_id,
@@ -422,23 +483,51 @@ def renew(
         "subaction": "choose_order",
         "choose_order_subaction": "show_contract_details",
     }
-    session.post(url, headers=headers, data=data)
+    try:
+        choose_response = session.post(url, headers=headers, data=data)
+        log("[Renew] ServerID: {} 已打开合同详情，HTTP 状态码: {}".format(
+            order_id, choose_response.status_code
+        ))
+        choose_response.raise_for_status()
+    except requests.RequestException as exc:
+        log("[Renew] ServerID: {} 续期失败：打开合同详情请求异常: {}".format(
+            order_id, exc
+        ))
+        return False
 
     # 弹出 'Security Check' 窗口，将自动触发 '发送 PIN'。
-    session.post(
-        url,
-        headers=headers,
-        data={
-            "sess_id": sess_id,
-            "subaction": "show_kc2_security_password_dialog",
-            "prefix": "kc2_customer_contract_details_extend_contract_",
-            "type": "1",
-        },
-    )
+    try:
+        pin_dialog_response = session.post(
+            url,
+            headers=headers,
+            data={
+                "sess_id": sess_id,
+                "subaction": "show_kc2_security_password_dialog",
+                "prefix": "kc2_customer_contract_details_extend_contract_",
+                "type": "1",
+            },
+        )
+        log("[Renew] ServerID: {} 已触发 Security Check/PIN 邮件请求，HTTP 状态码: {}".format(
+            order_id, pin_dialog_response.status_code
+        ))
+        pin_dialog_response.raise_for_status()
+    except requests.RequestException as exc:
+        log("[Renew] ServerID: {} 续期失败：触发 PIN 邮件请求异常: {}".format(
+            order_id, exc
+        ))
+        return False
 
     # 等待邮件解析器解析出 PIN
+    log("[Renew] ServerID: {} 等待 Mailparser 解析 PIN，等待 {} 秒。".format(
+        order_id, WAITING_TIME_OF_PIN
+    ))
     time.sleep(WAITING_TIME_OF_PIN)
     pin = get_pin_from_mailparser(mailparser_dl_url_id)
+    if not pin:
+        log("[Renew] ServerID: {} 续期失败：登录已成功，但未能从 Mailparser 获取 PIN。".format(
+            order_id
+        ))
+        return False
     log(f"[MailParser] PIN: {pin}")
 
     # 使用 PIN 获取 token
@@ -450,19 +539,60 @@ def renew(
         "type": 1,
         "ident": f"kc2_customer_contract_details_extend_contract_{order_id}",
     }
-    f = session.post(url, headers=headers, data=data)
-    f.raise_for_status()
-    if not json.loads(f.text)["rs"] == "success":
+    try:
+        f = session.post(url, headers=headers, data=data)
+        log("[Renew] ServerID: {} 已提交 PIN 换取 token，HTTP 状态码: {}".format(
+            order_id, f.status_code
+        ))
+        f.raise_for_status()
+    except requests.RequestException as exc:
+        log("[Renew] ServerID: {} 续期失败：提交 PIN 换取 token 请求异常: {}".format(
+            order_id, exc
+        ))
         return False
-    token = json.loads(f.text)["token"]["value"]
+
+    try:
+        token_response = json.loads(f.text)
+    except ValueError as exc:
+        log("[Renew] ServerID: {} 续期失败：token 响应不是合法 JSON: {}".format(
+            order_id, exc
+        ))
+        log("[Renew] token 响应片段: {}".format(f.text[:500]))
+        return False
+
+    if token_response.get("rs") != "success":
+        log("[Renew] ServerID: {} 续期失败：PIN/token 校验未通过。".format(order_id))
+        log("[Renew] token 响应摘要: {}".format(summarize_payload(token_response)))
+        return False
+
+    token_data = token_response.get("token")
+    token = token_data.get("value") if isinstance(token_data, dict) else ""
+    if not token:
+        log("[Renew] ServerID: {} 续期失败：token 响应中没有 token.value。".format(order_id))
+        log("[Renew] token 响应摘要: {}".format(summarize_payload(token_response)))
+        return False
+
+    log("[Renew] ServerID: {} 成功获取续期 token。".format(order_id))
     data = {
         "sess_id": sess_id,
         "ord_id": order_id,
         "subaction": "kc2_customer_contract_details_extend_contract_term",
         "token": token,
     }
-    session.post(url, headers=headers, data=data)
+    try:
+        renew_response = session.post(url, headers=headers, data=data)
+        log("[Renew] ServerID: {} 已提交最终续期请求，HTTP 状态码: {}".format(
+            order_id, renew_response.status_code
+        ))
+        renew_response.raise_for_status()
+    except requests.RequestException as exc:
+        log("[Renew] ServerID: {} 续期失败：提交最终续期请求异常: {}".format(
+            order_id, exc
+        ))
+        return False
+
     time.sleep(5)
+    log("[Renew] ServerID: {} 续期请求流程完成，准备后续检查状态。".format(order_id))
     return True
 
 # 检查续期状态
@@ -519,6 +649,9 @@ def main_handler(event, context):
     if not USERNAME or not PASSWORD:
         log("[AutoEUServerless] 你没有添加任何账户")
         exit(1)
+    if not MAILPARSER_DOWNLOAD_URL_ID:
+        log("[MailParser] 未配置 MAILPARSER_DOWNLOAD_URL_ID，无法在续期阶段获取 PIN。")
+        exit(1)
     user_list = USERNAME.strip().split()
     passwd_list = PASSWORD.strip().split()
     mailparser_dl_url_id_list = MAILPARSER_DOWNLOAD_URL_ID.strip().split()
@@ -535,11 +668,28 @@ def main_handler(event, context):
         if sessid == "-1":
             log("[AutoEUServerless] 第 %d 个账号登陆失败，请检查登录信息" % (i + 1))
             continue
-        SERVERS = get_servers(sessid, s)
+        log("[Login] 第 {} 个账号登录成功，开始获取 VPS 列表。".format(i + 1))
+        try:
+            SERVERS = get_servers(sessid, s)
+        except Exception as exc:
+            log("[AutoEUServerless] 第 {} 个账号获取 VPS 列表失败: {}: {}".format(
+                i + 1, type(exc).__name__, exc
+            ))
+            continue
         log("[AutoEUServerless] 检测到第 {} 个账号有 {} 台 VPS，正在尝试续期".format(i + 1, len(SERVERS)))
         for k, v in SERVERS.items():
             if v:
-                if not renew(sessid, s, passwd_list[i], k, mailparser_dl_url_id_list[i]):
+                log("[Renew] ServerID: {} 需要续期，进入续期阶段。".format(k))
+                try:
+                    renew_success = renew(
+                        sessid, s, passwd_list[i], k, mailparser_dl_url_id_list[i]
+                    )
+                except Exception as exc:
+                    log("[Renew] ServerID: {} 续期阶段发生未捕获异常: {}: {}".format(
+                        k, type(exc).__name__, exc
+                    ))
+                    renew_success = False
+                if not renew_success:
                     log("[AutoEUServerless] ServerID: %s 续订错误!" % k)
                 else:
                     log("[AutoEUServerless] ServerID: %s 已成功续订!" % k)
