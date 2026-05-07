@@ -153,3 +153,4 @@ cython_debug/
 
 # Captcha debug artifacts
 captcha_images/
+captcha_debug*/

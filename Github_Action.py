@@ -142,7 +142,7 @@ def normalize_captcha_code(raw_text: str) -> str:
             return str(left - right)
         return str(left * right)
 
-    if re.fullmatch(r"[0-9A-Za-z]{3,8}", text):
+    if re.fullmatch(r"[0-9A-Za-z]{6}", text):
         return text
     return ""
 
@@ -161,20 +161,81 @@ def save_captcha_image(image_content: bytes, source: str) -> str:
     log("[Captcha Solver] 已保存登录验证码图片: {}".format(path))
     return path
 
-# 生成适合 Tesseract 的验证码图片变体
-def build_tesseract_image_variants(image):
-    from PIL import Image, ImageFilter, ImageOps
+# 放大图片以提升 Tesseract 对小字符的识别率
+def upscale_for_ocr(image, factor=3, border=4):
+    from PIL import Image, ImageOps
 
     resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    bordered = ImageOps.expand(image, border=border, fill=255)
+    width, height = bordered.size
+    return bordered.resize((width * factor, height * factor), resampling)
+
+# 提取 EUserv 验证码常见的橙色前景
+def build_orange_foreground_mask(image):
+    from PIL import Image
+
+    hsv = image.convert("HSV")
+    mask = Image.new("L", hsv.size, 255)
+    source = hsv.load()
+    target = mask.load()
+    for y in range(hsv.size[1]):
+        for x in range(hsv.size[0]):
+            hue, saturation, value = source[x, y]
+            if 2 <= hue <= 35 and saturation >= 45 and value >= 80:
+                target[x, y] = 0
+    return mask
+
+# 裁剪二值图前景，避免长干扰线和空白边缘影响 Tesseract
+def crop_foreground(image, pad=2):
+    pixels = image.load()
+    xs = []
+    ys = []
+    for y in range(image.size[1]):
+        for x in range(image.size[0]):
+            if pixels[x, y] < 128:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return image
+
+    left = max(0, min(xs) - pad)
+    top = max(0, min(ys) - pad)
+    right = min(image.size[0], max(xs) + pad + 1)
+    bottom = min(image.size[1], max(ys) + pad + 1)
+    return image.crop((left, top, right, bottom))
+
+# 生成适合 Tesseract 的验证码图片变体
+def build_tesseract_image_variants(image):
+    from PIL import ImageFilter, ImageOps
+
     grayscale = ImageOps.autocontrast(image.convert("L"))
-    width, height = grayscale.size
-    scaled = grayscale.resize((width * 3, height * 3), resampling)
+    scaled = upscale_for_ocr(grayscale)
     denoised = scaled.filter(ImageFilter.MedianFilter(size=3))
 
     variants = [scaled, denoised]
     for threshold in (110, 140, 170, 200):
         variants.append(scaled.point(lambda pixel, t=threshold: 255 if pixel > t else 0))
         variants.append(denoised.point(lambda pixel, t=threshold: 255 if pixel > t else 0))
+
+    orange_base = build_orange_foreground_mask(image)
+    # 先在原图尺度去除细干扰线，再裁剪放大。这个策略对 EUserv 橙色验证码更稳定。
+    orange_opened = orange_base.filter(ImageFilter.MaxFilter(size=5)).filter(
+        ImageFilter.MinFilter(size=5)
+    )
+    for pad in (0, 2, 4, 8, 12):
+        cropped = crop_foreground(orange_opened, pad=pad)
+        for factor in (1, 2, 3, 4, 5, 6, 8):
+            variants.append(upscale_for_ocr(cropped, factor=factor, border=8))
+
+    orange_mask = upscale_for_ocr(orange_base)
+    orange_denoised = orange_mask.filter(ImageFilter.MedianFilter(size=3))
+    orange_opened = orange_denoised.filter(ImageFilter.MaxFilter(size=3)).filter(
+        ImageFilter.MinFilter(size=3)
+    )
+    orange_closed = orange_denoised.filter(ImageFilter.MinFilter(size=3)).filter(
+        ImageFilter.MaxFilter(size=3)
+    )
+    variants.extend([orange_mask, orange_denoised, orange_opened, orange_closed])
     return variants
 
 # 本地 Tesseract 验证码解决器
@@ -203,9 +264,8 @@ def tesseract_captcha_solver(captcha_image_url: str, session: requests.session) 
         return ""
 
     configs = [
-        "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-xX*",
-        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-xX*",
-        "--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+-xX*",
+        "--oem 3 --psm 8 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-xX* -c load_system_dawg=0 -c load_freq_dawg=0",
+        "--oem 3 --psm 13 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-xX* -c load_system_dawg=0 -c load_freq_dawg=0",
     ]
     candidates = {}
     for variant in build_tesseract_image_variants(image):
