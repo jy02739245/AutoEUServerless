@@ -45,10 +45,10 @@ user_agent = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/95.0.4638.69 Safari/537.36"
 )
-desp = ""  # 日志信息
+desp = ""  # Telegram 通知内容
 _DDDDOCR_INSTANCE = None
 
-def log(info: str):
+def log(info: str, notify: bool = False):
     emoji_map = {
         "正在续费": "🔄",
         "检测到": "🔍",
@@ -75,8 +75,9 @@ def log(info: str):
             break
 
     print(info)
-    global desp
-    desp += info + "\n\n"
+    if notify:
+        global desp
+        desp += info + "\n\n"
 
 
 # 登录重试装饰器
@@ -512,7 +513,7 @@ def renew(
     # 等待邮件解析器解析出 PIN
     log("[Renew] ServerID: {} 等待 Mailparser 解析 PIN，等待 {} 秒。".format(
         order_id, WAITING_TIME_OF_PIN
-    ))
+    ), notify=True)
     time.sleep(WAITING_TIME_OF_PIN)
     pin = get_pin_from_mailparser(mailparser_dl_url_id)
     if not pin:
@@ -520,7 +521,7 @@ def renew(
             order_id
         ))
         return False
-    log(f"[MailParser] PIN: {pin}")
+    log(f"[MailParser] PIN: {pin}", notify=True)
 
     # 使用 PIN 获取 token
     data = {
@@ -603,27 +604,11 @@ def check(sess_id: str, session: requests.session):
 
 # 发送 Telegram 通知
 def telegram():
-    message = (
-        "<b>AutoEUServerless 日志</b>\n\n" + desp +
-        "\n<b>版权声明：</b>\n"
-        "本脚本基于 GPL-3.0 许可协议，版权所有。\n\n"
-        
-        "<b>致谢：</b>\n"
-        "特别感谢 <a href='https://github.com/lw9726/eu_ex'>eu_ex</a> 的贡献和启发, 本项目在此基础整理。\n"
-        "开发者：<a href='https://github.com/lw9726/eu_ex'>WizisCool</a>\n"
-        "<a href='https://www.nodeseek.com/space/8902#/general'>个人Nodeseek主页</a>\n"
-        "<a href='https://dooo.ng'>个人小站Dooo.ng</a>\n\n"
-        "<b>支持项目：</b>\n"
-        "⭐️ 给我们一个 GitHub Star! ⭐️\n"
-        "<a href='https://github.com/WizisCool/AutoEUServerless'>访问 GitHub 项目</a>"
-    )
+    message = desp.strip() or "[AutoEUServerless] 本次运行没有生成续期通知。"
 
-    # 请不要删除本段版权声明, 开发不易, 感谢! 感谢!
-    # 请勿二次售卖,出售,开源不易,万分感谢!
     data = {
         "chat_id": TG_USER_ID,
         "text": message,
-        "parse_mode": "HTML",
         "disable_web_page_preview": "true"
     }
     response = requests.post(
@@ -655,12 +640,12 @@ def main_handler(event, context):
         exit(1)
     for i in range(len(user_list)):
         print("*" * 30)
-        log("[AutoEUServerless] 正在续费第 %d 个账号" % (i + 1))
+        log("[AutoEUServerless] 正在续费第 %d 个账号" % (i + 1), notify=True)
         sessid, s = login(user_list[i], passwd_list[i])
         if sessid == "-1":
             log("[AutoEUServerless] 第 %d 个账号登陆失败，请检查登录信息" % (i + 1))
             continue
-        log("[Login] 第 {} 个账号登录成功，开始获取 VPS 列表。".format(i + 1))
+        log("[Login] 第 {} 个账号登录成功，开始获取 VPS 列表。".format(i + 1), notify=True)
         try:
             SERVERS = get_servers(sessid, s)
         except Exception as exc:
@@ -668,7 +653,7 @@ def main_handler(event, context):
                 i + 1, type(exc).__name__, exc
             ))
             continue
-        log("[AutoEUServerless] 检测到第 {} 个账号有 {} 台 VPS，正在尝试续期".format(i + 1, len(SERVERS)))
+        log("[AutoEUServerless] 检测到第 {} 个账号有 {} 台 VPS，正在尝试续期".format(i + 1, len(SERVERS)), notify=True)
         for k, v in SERVERS.items():
             if v:
                 log("[Renew] ServerID: {} 需要续期，进入续期阶段。".format(k))
@@ -684,7 +669,7 @@ def main_handler(event, context):
                 if not renew_success:
                     log("[AutoEUServerless] ServerID: %s 续订错误!" % k)
                 else:
-                    log("[AutoEUServerless] ServerID: %s 已成功续订!" % k)
+                    log("[AutoEUServerless] ServerID: %s 已成功续订!" % k, notify=True)
             else:
                 log("[AutoEUServerless] ServerID: %s 无需更新" % k)
         time.sleep(15)
