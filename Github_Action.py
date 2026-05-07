@@ -100,25 +100,20 @@ def log(info: str):
 def login_retry(*args, **kwargs):
     def wrapper(func):
         def inner(username, password):
-            ret, ret_session = func(username, password)
             max_retry = kwargs.get("max_retry")
             # 默认重试 3 次
             if not max_retry:
                 max_retry = 3
-            number = 0
-            if ret == "-1":
-                while number < max_retry:
-                    number += 1
-                    if number > 1:
-                        log("[AutoEUServerless] 登录尝试第 {} 次".format(number))
-                    sess_id, session = func(username, password)
-                    if sess_id != "-1":
-                        return sess_id, session
-                    else:
-                        if number == max_retry:
-                            return sess_id, session
-            else:
-                return ret, ret_session
+
+            last_sess_id = "-1"
+            last_session = None
+            for number in range(1, max_retry + 1):
+                if number > 1:
+                    log("[AutoEUServerless] 登录尝试第 {} 次".format(number))
+                last_sess_id, last_session = func(username, password)
+                if last_sess_id != "-1":
+                    return last_sess_id, last_session
+            return last_sess_id, last_session
         return inner
     return wrapper
 
@@ -154,12 +149,21 @@ def save_captcha_image(image_content: bytes, source: str) -> str:
     os.makedirs(CAPTCHA_IMAGE_SAVE_DIR, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     millisecond = int(time.time() * 1000) % 1000
-    filename = "login_captcha_{}_{}_{:03d}.png".format(source, timestamp, millisecond)
+    source_part = "_{}".format(source) if source else ""
+    filename = "login_captcha{}_{}_{:03d}.png".format(
+        source_part, timestamp, millisecond
+    )
     path = os.path.join(CAPTCHA_IMAGE_SAVE_DIR, filename)
     with open(path, "wb") as f:
         f.write(image_content)
     log("[Captcha Solver] 已保存登录验证码图片: {}".format(path))
     return path
+
+# 获取登录验证码原图。只请求一次，避免本地 OCR 和 TrueCaptcha 看到不同验证码。
+def fetch_captcha_image(captcha_image_url: str, session: requests.session) -> bytes:
+    response = session.get(captcha_image_url)
+    response.raise_for_status()
+    return response.content
 
 # 放大图片以提升 Tesseract 对小字符的识别率
 def upscale_for_ocr(image, factor=3, border=4):
@@ -239,7 +243,7 @@ def build_tesseract_image_variants(image):
     return variants
 
 # 本地 Tesseract 验证码解决器
-def tesseract_captcha_solver(captcha_image_url: str, session: requests.session) -> str:
+def tesseract_captcha_solver(captcha_image_content: bytes) -> str:
     if not ENABLE_TESSERACT_OCR:
         return ""
     if not shutil.which("tesseract"):
@@ -253,12 +257,8 @@ def tesseract_captcha_solver(captcha_image_url: str, session: requests.session) 
         log("[Captcha Solver] 未安装 pytesseract 或 Pillow，跳过本地 OCR。")
         return ""
 
-    response = session.get(captcha_image_url)
-    response.raise_for_status()
-    save_captcha_image(response.content, "tesseract")
-
     try:
-        image = Image.open(io.BytesIO(response.content))
+        image = Image.open(io.BytesIO(captcha_image_content))
     except Exception as exc:
         log("[Captcha Solver] 本地 OCR 无法读取验证码图片: {}".format(exc))
         return ""
@@ -288,16 +288,13 @@ def tesseract_captcha_solver(captcha_image_url: str, session: requests.session) 
     return captcha_code
 
 # TrueCaptcha 验证码解决器
-def truecaptcha_solver(captcha_image_url: str, session: requests.session) -> dict:
+def truecaptcha_solver(captcha_image_content: bytes) -> dict:
     # TrueCaptcha API 文档: https://apitruecaptcha.org/api
     # 似乎已经无法免费试用,但是充值1刀可以识别3000个二维码,足够用一阵子了
     if not TRUECAPTCHA_USERID or not TRUECAPTCHA_APIKEY:
         raise CaptchaSolverError("本地 OCR 识别失败，且未配置 TrueCaptcha。")
 
-    response = session.get(captcha_image_url)
-    response.raise_for_status()
-    save_captcha_image(response.content, "truecaptcha")
-    encoded_string = base64.b64encode(response.content)
+    encoded_string = base64.b64encode(captcha_image_content)
     url = "https://api.apitruecaptcha.org/one/gettext"
 
     data = {
@@ -313,7 +310,10 @@ def truecaptcha_solver(captcha_image_url: str, session: requests.session) -> dic
 
 # 验证码解决器
 def captcha_solver(captcha_image_url: str, session: requests.session) -> (str, str):
-    captcha_code = tesseract_captcha_solver(captcha_image_url, session)
+    captcha_image_content = fetch_captcha_image(captcha_image_url, session)
+    save_captcha_image(captcha_image_content, "")
+
+    captcha_code = tesseract_captcha_solver(captcha_image_content)
     if captcha_code:
         return captcha_code, "tesseract"
 
@@ -321,8 +321,12 @@ def captcha_solver(captcha_image_url: str, session: requests.session) -> (str, s
         log("[Captcha Solver] 本地 OCR 识别失败，且未配置 TrueCaptcha。")
         return "", "none"
 
-    solved_result = truecaptcha_solver(captcha_image_url, session)
-    return handle_captcha_solved_result(solved_result), "truecaptcha"
+    try:
+        solved_result = truecaptcha_solver(captcha_image_content)
+        return handle_captcha_solved_result(solved_result), "truecaptcha"
+    except CaptchaSolverError as exc:
+        log("[Captcha Solver] {}".format(exc))
+        return "", "truecaptcha"
 
 # 处理验证码解决结果
 def handle_captcha_solved_result(solved: dict) -> str:
