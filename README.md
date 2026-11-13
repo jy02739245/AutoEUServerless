@@ -43,6 +43,7 @@ TRC20: TBY7e7YUQCG7wEH3PA8pk6fQPwpshb8Z55
 **目前国内厂家只剩华为一家,估计也要很快收费了
 就EUserV自动续费项目而言,推荐使用Github Action来完成,100%稳定,目前已经更新了Workflow代码
 Fork一个到自己的仓库然后点个Star⭐️ 改一下仓库的Action Secrets 即可**
+Workflow 默认每月10号 UTC 12:00(北京时间 20:00)运行一次,需要调整就改 [`.github/workflows/auto_euserv.yml`](.github/workflows/auto_euserv.yml) 里的 cron,也可以在 Actions 页面手动 Run workflow 补跑
 
 ## 截图  
 ![Alt text](image/screenshot1.png)
@@ -104,9 +105,9 @@ Fork一个到自己的仓库然后点个Star⭐️ 改一下仓库的Action Secr
 10. 创建定时触发器
     ![Step10](image/step10.png)
     ```
-    0 0 12 */7 * * *
+    0 0 12 10 * * *
     ```
-    - 代表每七天的中午12点触发一次,你也可以自定义
+    - 代表每月10号的中午12点触发一次,你也可以自定义
 
 #### 11. 现在你可以毫无顾虑的让你的🐥小鸡吃灰了
 
